@@ -37,6 +37,11 @@ def main():
     date_range = conn.execute("SELECT MIN(date), MAX(date) FROM matches").fetchone()
     print(f"  rango de fechas en matches: {date_range[0]} a {date_range[1]}")
 
+    stage_counts = conn.execute(
+        "SELECT COALESCE(stage, 'sin clasificar'), COUNT(*) FROM matches GROUP BY stage"
+    ).fetchall()
+    print(f"  partidos por torneo: {dict(stage_counts)}")
+
     # ----------------------- EQUIPOS Y SU COBERTURA -----------------------------
     section("EQUIPOS Y SU COBERTURA DE DATOS")
     print(f"{'Equipo':<28} {'Partidos':>9} {'Zona':>6} {'Prom.':>6} {'Anual':>6}")
@@ -97,17 +102,14 @@ def main():
     # ----------------------- MUESTRA DE PARTIDOS -----------------------------
     section("MUESTRA DE PARTIDOS (10 mas recientes)")
     sample = conn.execute(
-        """SELECT m.date, m.zone, t1.name, m.home_goals, m.away_goals, t2.name
+        """SELECT m.date, m.round_name, m.stage, t1.name, m.home_goals, m.away_goals, t2.name
            FROM matches m
            JOIN teams t1 ON t1.id = m.home_team_id
            JOIN teams t2 ON t2.id = m.away_team_id
            ORDER BY m.date DESC LIMIT 10"""
     ).fetchall()
-    for date, zone_col, home, hg, ag, away in sample:
-        print(f"  {date} [{zone_col}]: {home} {hg}-{ag} {away}")
-    print("\n  (la columna [zone] en realidad guarda el nombre de la fecha,")
-    print("   ej. 'Fecha 11' -- no la zona A/B. Es un nombre de columna")
-    print("   heredado que no afecta al modelo, pero es confuso al leerlo.)")
+    for date, round_name, stage, home, hg, ag, away in sample:
+        print(f"  {date} [{stage or '?'} - {round_name or 's/d'}]: {home} {hg}-{ag} {away}")
 
     # ----------------------- TABLA DE ZONA COMPLETA -----------------------------
     section("TABLA DE ZONA (Clausura)")

@@ -60,9 +60,9 @@ def store_games(conn, games, valid_team_ids=None):
             date = g["start_time"] or ""
         cur = conn.execute(
             """INSERT OR IGNORE INTO matches
-               (date, matchday, zone, home_team_id, away_team_id, home_goals, away_goals)
-               VALUES (?,?,?,?,?,?,?)""",
-            (date, 0, g.get("round_name") or "", home_id, away_id,
+               (date, matchday, round_name, stage, home_team_id, away_team_id, home_goals, away_goals)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (date, 0, g.get("round_name") or "", db.infer_stage(date), home_id, away_id,
              g["home_goals"], g["away_goals"]),
         )
         if cur.rowcount:

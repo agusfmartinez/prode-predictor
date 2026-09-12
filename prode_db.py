@@ -35,6 +35,21 @@ import os
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "prode.db")
 
+# El Clausura 2026 arranco alrededor de esta fecha (segun el historial
+# real: la "Fecha 1" del Clausura para varios equipos cayo el
+# 26-07-2026). Partidos con fecha anterior a esto son del Apertura.
+# Ambos torneos reusan los mismos numeros de fecha ("Fecha 9" existe
+# en los dos), por eso hace falta esta distincion aparte.
+STAGE_CUTOFF_DATE = "2026-07-15"
+
+
+def infer_stage(date_iso):
+    """Devuelve 'Apertura' o 'Clausura' segun la fecha (formato
+    YYYY-MM-DD). Ver STAGE_CUTOFF_DATE."""
+    if not date_iso:
+        return None
+    return "Clausura" if date_iso >= STAGE_CUTOFF_DATE else "Apertura"
+
 
 # ----------------------- ESQUEMA -----------------------------
 
@@ -49,7 +64,14 @@ CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
     matchday INTEGER,
-    zone TEXT,
+    round_name TEXT, -- ej "Fecha 9". OJO: se repite entre Apertura y
+                      -- Clausura (cada torneo tiene su propia "Fecha 9"),
+                      -- por eso NO alcanza para filtrar por torneo -- usar
+                      -- la columna `stage` para eso.
+    stage TEXT,       -- 'Apertura' o 'Clausura', calculado por fecha
+                      -- (ver STAGE_CUTOFF_DATE). Promiedos no manda esto
+                      -- directo en cada partido, solo en las tablas
+                      -- agregadas, asi que lo inferimos nosotros.
     home_team_id INTEGER NOT NULL REFERENCES teams(id),
     away_team_id INTEGER NOT NULL REFERENCES teams(id),
     home_goals INTEGER NOT NULL,
@@ -129,8 +151,40 @@ def init_db():
     conn = get_conn()
     conn.executescript(SCHEMA)
     conn.commit()
+    migrate_schema(conn)
     conn.close()
     print(f"Base creada/verificada en {DB_PATH}")
+
+
+def migrate_schema(conn):
+    """Actualiza bases ya existentes creadas con el esquema viejo, sin
+    perder datos:
+      1) si la columna vieja `zone` todavia existe en `matches`, la
+         renombra a `round_name` (el nombre real de lo que guarda,
+         ej. "Fecha 9" -- nunca fue la zona A/B).
+      2) si no existe la columna `stage`, la agrega y la completa
+         retroactivamente segun la fecha de cada partido.
+    Es seguro correrla mas de una vez: no hace nada si ya esta
+    todo migrado."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(matches)").fetchall()}
+
+    if "zone" in cols and "round_name" not in cols:
+        conn.execute("ALTER TABLE matches RENAME COLUMN zone TO round_name")
+        cols.discard("zone")
+        cols.add("round_name")
+        print("Migracion: columna 'zone' de matches renombrada a 'round_name'.")
+
+    if "stage" not in cols:
+        conn.execute("ALTER TABLE matches ADD COLUMN stage TEXT")
+        rows = conn.execute("SELECT id, date FROM matches").fetchall()
+        for match_id, date in rows:
+            conn.execute(
+                "UPDATE matches SET stage = ? WHERE id = ?",
+                (infer_stage(date), match_id),
+            )
+        print(f"Migracion: columna 'stage' agregada y completada para {len(rows)} partidos.")
+
+    conn.commit()
 
 
 # ----------------------- IMPORTAR CSV (CARGA A MANO) -----------------------------
@@ -237,13 +291,19 @@ def import_standings_zone_csv(conn, path):
 
 # ----------------------- CONSULTAS: RENDIMIENTO LOCAL/VISITANTE -----------------------------
 
-def home_form(conn, team_id, last_n=5):
-    """Promedio de goles a favor/en contra de un equipo SOLO cuando jugo de local."""
-    rows = conn.execute(
-        """SELECT home_goals, away_goals FROM matches
-           WHERE home_team_id = ? ORDER BY date DESC LIMIT ?""",
-        (team_id, last_n),
-    ).fetchall()
+def home_form(conn, team_id, last_n=5, stage=None):
+    """Promedio de goles a favor/en contra de un equipo SOLO cuando jugo
+    de local. Si se pasa `stage` ('Apertura'/'Clausura'), filtra solo
+    los partidos de ese torneo -- recomendado para no mezclar forma
+    reciente de un torneo ya terminado con la del actual."""
+    query = "SELECT home_goals, away_goals FROM matches WHERE home_team_id = ?"
+    params = [team_id]
+    if stage:
+        query += " AND stage = ?"
+        params.append(stage)
+    query += " ORDER BY date DESC LIMIT ?"
+    params.append(last_n)
+    rows = conn.execute(query, params).fetchall()
     if not rows:
         return None, None
     gf = sum(r[0] for r in rows) / len(rows)
@@ -251,13 +311,16 @@ def home_form(conn, team_id, last_n=5):
     return gf, gc
 
 
-def away_form(conn, team_id, last_n=5):
-    """Promedio de goles a favor/en contra de un equipo SOLO cuando jugo de visitante."""
-    rows = conn.execute(
-        """SELECT away_goals, home_goals FROM matches
-           WHERE away_team_id = ? ORDER BY date DESC LIMIT ?""",
-        (team_id, last_n),
-    ).fetchall()
+def away_form(conn, team_id, last_n=5, stage=None):
+    """Igual que home_form pero para partidos de visitante."""
+    query = "SELECT away_goals, home_goals FROM matches WHERE away_team_id = ?"
+    params = [team_id]
+    if stage:
+        query += " AND stage = ?"
+        params.append(stage)
+    query += " ORDER BY date DESC LIMIT ?"
+    params.append(last_n)
+    rows = conn.execute(query, params).fetchall()
     if not rows:
         return None, None
     gf = sum(r[0] for r in rows) / len(rows)

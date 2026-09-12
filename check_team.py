@@ -35,16 +35,21 @@ def show_team_detail(conn, team_id, name):
     ).fetchone()[0]
     print(f"Partidos guardados en total: {n_matches}")
 
-    home_gf, home_gc = db.home_form(conn, team_id)
-    away_gf, away_gc = db.away_form(conn, team_id)
+    home_gf, home_gc = db.home_form(conn, team_id, stage="Clausura")
+    away_gf, away_gc = db.away_form(conn, team_id, stage="Clausura")
     if home_gf is not None:
-        print(f"Forma de LOCAL (ultimos partidos): GF={home_gf} GC={home_gc}")
+        print(f"Forma de LOCAL solo Clausura (ultimos partidos): GF={home_gf} GC={home_gc}")
     else:
-        print("Forma de LOCAL: sin datos todavia")
+        print("Forma de LOCAL solo Clausura: sin datos todavia (usaria respaldo general)")
     if away_gf is not None:
-        print(f"Forma de VISITANTE (ultimos partidos): GF={away_gf} GC={away_gc}")
+        print(f"Forma de VISITANTE solo Clausura (ultimos partidos): GF={away_gf} GC={away_gc}")
     else:
-        print("Forma de VISITANTE: sin datos todavia")
+        print("Forma de VISITANTE solo Clausura: sin datos todavia (usaria respaldo general)")
+
+    home_gf_all, home_gc_all = db.home_form(conn, team_id)
+    away_gf_all, away_gc_all = db.away_form(conn, team_id)
+    print(f"(Para comparar, sin filtrar por torneo: LOCAL GF={home_gf_all} GC={home_gc_all} "
+          f"/ VISITANTE GF={away_gf_all} GC={away_gc_all})")
 
     zone_row = conn.execute(
         "SELECT zone, position, points, played FROM standings_zone WHERE team_id=?",

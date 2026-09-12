@@ -113,9 +113,9 @@ def sync_current_round(conn, data):
             date = g["start_time"] or ""
         conn.execute(
             """INSERT OR IGNORE INTO matches
-               (date, matchday, zone, home_team_id, away_team_id, home_goals, away_goals)
-               VALUES (?,?,?,?,?,?,?)""",
-            (date, 0, g.get("round_name") or "", home_id, away_id,
+               (date, matchday, round_name, stage, home_team_id, away_team_id, home_goals, away_goals)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (date, 0, g.get("round_name") or "", db.infer_stage(date), home_id, away_id,
              g["home_goals"], g["away_goals"]),
         )
     conn.commit()
@@ -128,9 +128,22 @@ def poisson_pmf(lam, k):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
+CURRENT_STAGE = "Clausura"
+
+
 def predict_match(conn, home_id, away_id):
-    home_gf, home_gc = db.home_form(conn, home_id, LAST_N_GAMES)
-    away_gf, away_gc = db.away_form(conn, away_id, LAST_N_GAMES)
+    # Preferimos forma reciente SOLO del Clausura (torneo actual). Si
+    # un equipo todavia no tiene suficiente historial de este torneo
+    # (por ejemplo, muy al principio de la temporada), usamos como
+    # respaldo el historial general (incluyendo Apertura) en vez de
+    # caer directo al promedio neutro de liga.
+    home_gf, home_gc = db.home_form(conn, home_id, LAST_N_GAMES, stage=CURRENT_STAGE)
+    if home_gf is None:
+        home_gf, home_gc = db.home_form(conn, home_id, LAST_N_GAMES)
+
+    away_gf, away_gc = db.away_form(conn, away_id, LAST_N_GAMES, stage=CURRENT_STAGE)
+    if away_gf is None:
+        away_gf, away_gc = db.away_form(conn, away_id, LAST_N_GAMES)
 
     home_gf = home_gf if home_gf is not None else LEAGUE_AVG_GOALS_PER_TEAM
     home_gc = home_gc if home_gc is not None else LEAGUE_AVG_GOALS_PER_TEAM
