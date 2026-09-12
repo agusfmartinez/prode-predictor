@@ -1,43 +1,41 @@
 """
-prode_predictor.py (v2 - con base de datos local)
-====================================================
-Version que usa prode_db.py como cache. La idea:
+prode_predictor.py (v3 - 100% Promiedos, sin API paga)
+=========================================================
+Ya no usa API-Football. Todo sale de un solo endpoint de Promiedos:
 
-  1) Vos ya hiciste la carga inicial a mano (ver plantilla_*.csv y
-     "python prode_db.py --init / --import-csv").
-  2) Cada semana, este script:
-       a) le pide a la API SOLO los resultados de la fecha que se
-          acaba de jugar (no todo el historial) y los guarda en
-          la base con prode_db.import_results_csv-equivalente,
-       b) le pide el fixture de la fecha que viene,
-       c) para cada partido, calcula el pronostico usando los datos
-          que YA estan en la base (home_form / away_form / stakes),
-          sin golpear la API de nuevo para eso.
-  3) Vos actualizas las tablas (zona/promedios/anual) a mano una vez
-     por semana con los CSV, porque cambian poco y así no gastás
-     requests en algo que podés copiar de la tabla oficial en 2 minutos.
+    https://api.promiedos.com.ar/league/tables_and_fixtures/hc
 
-Esto baja el consumo de API de "todo cada vez" a "solo lo nuevo".
+Flujo de cada corrida:
+  1) Trae ese JSON (una sola request).
+  2) Actualiza en la base: tabla de zona (Clausura Grupo A/B),
+     tabla de promedios, tabla anual, y los partidos de la fecha
+     actual (jugados y por jugar).
+  3) Para cada partido "por jugar" de la fecha actual, calcula el
+     pronostico usando el historial ya guardado en la base.
+  4) Manda el reporte por Telegram.
+
+Nota sobre el historial completo (para home_form / away_form):
+  Este endpoint solo trae los partidos de UNA fecha por request (la
+  marcada como "selected", normalmente la actual). Para tener varias
+  fechas de historial en la base, hay que:
+    a) correr este script cada semana (asi se va acumulando solo,
+       fecha a fecha, con el tiempo), o
+    b) cargar el historial viejo a mano una vez con los CSV de
+       plantilla (ver README), como plan B mientras se acumula.
 """
 
 import os
 import math
-import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 
 import prode_db as db
+import promiedos_client as pc
 
-load_dotenv()  # lee las variables desde el archivo .env si existe
+load_dotenv()
 
-# ----------------------- CONFIGURACION -----------------------------
-
-API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "PEGA_TU_API_KEY_ACA")
-API_BASE = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": API_FOOTBALL_KEY}
-
-LEAGUE_ID = 128     # confirmalo vos, ver README
-SEASON = 2026
+LEAGUE_ID = "hc"          # Liga Profesional Argentina
+STAGE_NAME = "Clausura"   # etapa actual del torneo
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -45,76 +43,95 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 LEAGUE_AVG_GOALS_PER_TEAM = 1.30
 HOME_ADVANTAGE = 1.15
 LAST_N_GAMES = 5
-DAYS_AHEAD = 7
-DAYS_BACK = 5   # para traer los resultados de la fecha recien jugada
 
 
-# ----------------------- PASO 1: TRAER SOLO LO NUEVO DE LA API -----------------------------
+# ----------------------- PASO 1: TRAER Y GUARDAR DATOS -----------------------------
 
-def sync_recent_results(conn):
-    """Trae de la API los partidos jugados en los ultimos DAYS_BACK dias
-    y los guarda en la base (si ya estan, no hace nada, por el
-    UNIQUE(date, home_team_id, away_team_id))."""
-    today = datetime.utcnow().date()
-    start = today - timedelta(days=DAYS_BACK)
-    params = {
-        "league": LEAGUE_ID, "season": SEASON,
-        "from": start.isoformat(), "to": today.isoformat(),
-        "status": "FT",  # solo partidos finalizados
-    }
-    r = requests.get(f"{API_BASE}/fixtures", headers=HEADERS, params=params, timeout=20)
-    r.raise_for_status()
-    games = r.json().get("response", [])
+def sync_standings(conn, data):
+    """Guarda las tablas de zona, promedios y anual en la base."""
+    for table_name, rows in pc.get_zone_tables(data, STAGE_NAME).items():
+        zone_letter = table_name.strip()[-1]
+        for r in rows:
+            team_id = db.get_or_create_team(conn, r["team_name"], zone_letter)
+            gf, gc = (r.get("Goals") or "0:0").split(":")
+            conn.execute(
+                """INSERT INTO standings_zone
+                   (team_id, zone, position, points, played, goals_for, goals_against, updated_at)
+                   VALUES (?,?,?,?,?,?,?, datetime('now'))
+                   ON CONFLICT(team_id) DO UPDATE SET
+                     zone=excluded.zone, position=excluded.position, points=excluded.points,
+                     played=excluded.played, goals_for=excluded.goals_for,
+                     goals_against=excluded.goals_against, updated_at=excluded.updated_at""",
+                (team_id, zone_letter, r["position"], int(r["Points"]),
+                 int(r["GamePlayed"]), int(gf), int(gc)),
+            )
 
-    nuevos = 0
-    for g in games:
-        home_name = g["teams"]["home"]["name"]
-        away_name = g["teams"]["away"]["name"]
-        home_id = db.get_or_create_team(conn, home_name)
-        away_id = db.get_or_create_team(conn, away_name)
-        date = g["fixture"]["date"][:10]
-        matchday = g["league"].get("round", "")
-        hg = g["goals"]["home"] or 0
-        ag = g["goals"]["away"] or 0
-        cur = conn.execute(
+    for r in pc.get_promedios_rows(data):
+        team_id = db.get_or_create_team(conn, r["team_name"])
+        conn.execute(
+            """INSERT INTO standings_promedios
+               (team_id, position, promedio, puntos_acumulados, partidos_computados, en_zona_descenso, updated_at)
+               VALUES (?,?,?,?,?,?, datetime('now'))
+               ON CONFLICT(team_id) DO UPDATE SET
+                 position=excluded.position, promedio=excluded.promedio,
+                 puntos_acumulados=excluded.puntos_acumulados,
+                 partidos_computados=excluded.partidos_computados,
+                 en_zona_descenso=excluded.en_zona_descenso,
+                 updated_at=excluded.updated_at""",
+            (team_id, r["position"], float(r["Pct"]), int(r["Points"]),
+             int(r["GamePlayed"]), r["en_zona_descenso"]),
+        )
+
+    for r in pc.get_anual_rows(data):
+        team_id = db.get_or_create_team(conn, r["team_name"])
+        conn.execute(
+            """INSERT INTO standings_anual (team_id, position, points, en_zona_copa, updated_at)
+               VALUES (?,?,?,?, datetime('now'))
+               ON CONFLICT(team_id) DO UPDATE SET
+                 position=excluded.position, points=excluded.points,
+                 en_zona_copa=excluded.en_zona_copa, updated_at=excluded.updated_at""",
+            (team_id, r["position"], int(r["Points"]), r["en_zona_copa"]),
+        )
+    conn.commit()
+
+
+def sync_current_round(conn, data):
+    """Guarda los partidos ya finalizados de la fecha actual en
+    `matches` (para ir acumulando historial), y devuelve la lista de
+    partidos de esa fecha para el reporte."""
+    round_name, games = pc.get_selected_round_games(data)
+    parsed = [pc.parse_game(g) for g in games]
+
+    for g in parsed:
+        if not g["finished"]:
+            continue
+        home_id = db.get_or_create_team(conn, g["home_team_name"])
+        away_id = db.get_or_create_team(conn, g["away_team_name"])
+        try:
+            date = datetime.strptime(g["start_time"], "%d-%m-%Y %H:%M").date().isoformat()
+        except (ValueError, TypeError):
+            date = g["start_time"] or ""
+        conn.execute(
             """INSERT OR IGNORE INTO matches
                (date, matchday, zone, home_team_id, away_team_id, home_goals, away_goals)
                VALUES (?,?,?,?,?,?,?)""",
-            (date, 0, "", home_id, away_id, hg, ag),
+            (date, 0, g.get("round_name") or "", home_id, away_id,
+             g["home_goals"], g["away_goals"]),
         )
-        if cur.rowcount:
-            nuevos += 1
     conn.commit()
-    print(f"Resultados nuevos agregados a la base: {nuevos}")
+    return round_name, parsed
 
 
-def get_upcoming_fixtures():
-    """Este si le pega a la API cada vez, porque el fixture de la
-    proxima fecha es justamente el dato que no podemos tener guardado
-    de antemano (puede reprogramarse)."""
-    today = datetime.utcnow().date()
-    end = today + timedelta(days=DAYS_AHEAD)
-    params = {
-        "league": LEAGUE_ID, "season": SEASON,
-        "from": today.isoformat(), "to": end.isoformat(),
-    }
-    r = requests.get(f"{API_BASE}/fixtures", headers=HEADERS, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json().get("response", [])
-
-
-# ----------------------- PASO 2: MODELO -----------------------------
+# ----------------------- PASO 2: MODELO (igual que antes) -----------------------------
 
 def poisson_pmf(lam, k):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def predict_match(conn, home_id, away_id, home_name, away_name):
+def predict_match(conn, home_id, away_id):
     home_gf, home_gc = db.home_form(conn, home_id, LAST_N_GAMES)
     away_gf, away_gc = db.away_form(conn, away_id, LAST_N_GAMES)
 
-    # si todavia no hay suficiente historial en la base, usamos el
-    # promedio de liga como valor neutro en vez de romper
     home_gf = home_gf if home_gf is not None else LEAGUE_AVG_GOALS_PER_TEAM
     home_gc = home_gc if home_gc is not None else LEAGUE_AVG_GOALS_PER_TEAM
     away_gf = away_gf if away_gf is not None else LEAGUE_AVG_GOALS_PER_TEAM
@@ -161,33 +178,25 @@ def predict_match(conn, home_id, away_id, home_name, away_name):
     pick = "1" if pct_home >= pct_draw and pct_home >= pct_away else \
            "2" if pct_away >= pct_home and pct_away >= pct_draw else "X"
 
-    return {
-        "score": best_score, "pct_home": pct_home, "pct_draw": pct_draw,
-        "pct_away": pct_away, "pick": pick,
-        "home_form_used": (round(home_gf, 2), round(home_gc, 2)),
-        "away_form_used": (round(away_gf, 2), round(away_gc, 2)),
-        "stakes": (round(home_stakes, 2), round(away_stakes, 2)),
-    }
+    return {"score": best_score, "pct_home": pct_home, "pct_draw": pct_draw,
+            "pct_away": pct_away, "pick": pick}
 
 
 # ----------------------- PASO 3: REPORTE -----------------------------
 
-def build_report(conn):
-    fixtures = get_upcoming_fixtures()
-    if not fixtures:
-        return "No encontre partidos programados en los proximos dias."
+def build_report(conn, round_name, games):
+    lines = [f"PRONOSTICOS - {round_name} (Torneo Clausura 2026)\n"]
+    for g in games:
+        if g["finished"]:
+            lines.append(f"{g['home_team_name']} {g['home_goals']}-{g['away_goals']} {g['away_team_name']} (Final)\n")
+            continue
 
-    lines = ["PRONOSTICOS - Torneo Clausura 2026\n"]
-    for f in fixtures:
-        home_name = f["teams"]["home"]["name"]
-        away_name = f["teams"]["away"]["name"]
-        home_id = db.get_or_create_team(conn, home_name)
-        away_id = db.get_or_create_team(conn, away_name)
-
-        pred = predict_match(conn, home_id, away_id, home_name, away_name)
+        home_id = db.get_or_create_team(conn, g["home_team_name"])
+        away_id = db.get_or_create_team(conn, g["away_team_name"])
+        pred = predict_match(conn, home_id, away_id)
 
         lines.append(
-            f"{home_name} vs {away_name}\n"
+            f"{g['home_team_name']} vs {g['away_team_name']}\n"
             f"  Marcador probable: {pred['score'][0]}-{pred['score'][1]}\n"
             f"  1: {pred['pct_home']}%  X: {pred['pct_draw']}%  2: {pred['pct_away']}%\n"
             f"  Pronostico: {pred['pick']}\n"
@@ -199,14 +208,17 @@ def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("(Telegram no configurado, solo imprimo el resultado)\n")
         return
+    import requests
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4000]})
 
 
 def main():
     conn = db.get_conn()
-    sync_recent_results(conn)     # (a) solo trae lo nuevo
-    report = build_report(conn)   # (b)+(c) fixture + calculo con datos locales
+    data = pc.fetch_league(LEAGUE_ID)
+    sync_standings(conn, data)
+    round_name, games = sync_current_round(conn, data)
+    report = build_report(conn, round_name, games)
     print(report)
     send_telegram(report)
     with open("ultima_fecha_pronosticos.txt", "w", encoding="utf-8") as f:

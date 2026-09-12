@@ -14,43 +14,41 @@ requests de API de más.
   `plantilla_tabla_zona.csv`, `plantilla_tabla_promedios.csv`,
   `plantilla_tabla_anual.csv` — para la carga inicial a mano.
 
-## Paso 1 — Carga inicial (una sola vez, a mano, sin gastar API)
+## Paso 1 — Carga inicial del historial (automática, un solo comando)
 
-1. Abrí los `plantilla_*.csv` y completalos con los datos reales:
-   - **`plantilla_resultados.csv`**: cargá todos los partidos ya jugados
-     del Clausura 2026 (fecha 1 a la última jugada). Es la parte que
-     más tiempo lleva, pero la sacás directa de la tabla de resultados
-     de canchallena.com o ligaprofesional.ar, copiando y pegando.
-   - **`plantilla_tabla_zona.csv`**: la tabla de posiciones de zona A y B,
-     tal cual figura hoy.
-   - **`plantilla_tabla_promedios.csv`**: la tabla de promedios (la que
-     define el descenso). Marcá `en_zona_descenso=1` para los últimos
-     2-3 equipos.
-   - **`plantilla_tabla_anual.csv`**: la tabla anual (la que define copas).
-     Marcá `en_zona_copa=1` para los que hoy clasificarían.
+Ya no hace falta completar los CSV a mano. `backfill_history.py` trae
+el historial completo de la temporada de cada equipo directo de su
+página en Promiedos (toda la temporada, no solo los últimos 5
+partidos) y lo guarda en la base:
 
-2. Corré:
-   ```
-   python prode_db.py --init
-   python prode_db.py --import-csv
-   ```
-   Esto crea `prode.db` y carga todo. De acá en adelante, ya no hace
-   falta tocar la API para tener el historial: está guardado.
+```
+python prode_db.py --init
+python backfill_history.py
+```
 
-## Paso 2 — Configurar las keys
+Esto tarda un par de minutos (30 equipos, con una pausa entre pedido y
+pedido para no saturar el sitio). Al terminar, `matches` ya tiene el
+historial completo y `home_form()`/`away_form()` van a funcionar bien
+desde la primera corrida de `prode_predictor.py`.
+
+Los CSV de plantilla (`plantilla_*.csv`) quedan como plan B: si en
+algún momento Promiedos cambia su estructura y `backfill_history.py`
+deja de andar, todavía se puede cargar el historial a mano con ellos
+(ver el detalle de columnas en cada archivo).
+
+## Paso 2 — Configurar Telegram (opcional, ya no hace falta API key de datos)
 
 ```
 pip install -r requirements.txt
 cp .env.example .env
-# editá .env y completá tus valores reales
+# editá .env y completá TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID si querés el envío automático
 ```
 
-El `.env` nunca se sube al repo (ya está en `.gitignore`). `prode_predictor.py`
-lo carga automáticamente al arrancar con `python-dotenv`.
-
-Si preferís no usar `.env` (por ejemplo corriendo en GitHub Actions), las
-mismas variables funcionan como variables de entorno / Secrets:
-`API_FOOTBALL_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+Los datos de fútbol ya no vienen de una API paga: `promiedos_client.py`
+consulta directamente `https://api.promiedos.com.ar/league/tables_and_fixtures/hc`,
+que es el mismo endpoint que usa la web de Promiedos (no es oficial ni
+está documentado, pero es gratis y no requiere key — ver `CLAUDE.md`
+para el detalle de por qué elegimos esta fuente).
 
 ## Paso 3 — Correrlo cada semana
 
@@ -66,17 +64,12 @@ Esto:
    (no vuelve a pedir historial completo).
 4. Te lo manda por Telegram y lo deja en `ultima_fecha_pronosticos.txt`.
 
-## Mantenimiento semanal manual (2 minutos)
+## Mantenimiento semanal
 
-Las tablas de zona, promedios y anual cambian solas cada fecha, pero no
-vale la pena automatizarlas todavía: son pocos datos y los sacás rápido
-de la tabla oficial. Actualizá los CSV correspondientes y volvé a correr:
-
-```
-python prode_db.py --import-csv
-```
-
-(los `INSERT ... ON CONFLICT` hacen que se actualice en vez de duplicar)
+Ya no hace falta nada manual — `prode_predictor.py` actualiza solo las
+tablas de zona, promedios y anual en cada corrida (vienen en el mismo
+JSON que el fixture). Los CSV de plantilla solo se usan si en algún
+momento hay que volver al plan B manual.
 
 ## Automatizarlo del todo (que corra solo)
 
