@@ -29,8 +29,24 @@ import re
 import json
 import requests
 
-BASE_URL = "https://api.promiedos.com.ar/league/tables_and_fixtures"
+BASE_URL = "https://api.promiedos.com.ar/league/tables_and_fixtures"  # ya no se usa, ver nota abajo
+LEAGUE_PAGE_BASE = "https://www.promiedos.com.ar/league"
 TEAM_PAGE_BASE = "https://www.promiedos.com.ar/team"
+
+# Headers que imitan un pedido hecho desde el navegador, apuntando a
+# promiedos.com.ar como origen. Sin esto, la API devuelve una
+# respuesta vacia ({}) -- parece chequear de donde viene el pedido en
+# vez de solo aceptar cualquier cliente HTTP.
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Referer": "https://www.promiedos.com.ar/",
+    "Origin": "https://www.promiedos.com.ar",
+}
 
 # La pagina de equipo (promiedos.com.ar/team/{url_name}/{id}) esta
 # armada con Next.js y trae TODOS sus datos incrustados en un
@@ -52,11 +68,30 @@ COLOR_SUDAMERICANA = "#23EBE4"
 COPA_COLORS = {COLOR_LIBERTADORES_CAMPEON, COLOR_LIBERTADORES, COLOR_SUDAMERICANA}
 
 
-def fetch_league(league_id="hc", timeout=20):
-    url = f"{BASE_URL}/{league_id}"
-    r = requests.get(url, timeout=timeout)
+def fetch_league(league_id="hc", url_name="liga-profesional", timeout=20):
+    """Trae los datos de la liga leyendo la pagina publica
+    (www.promiedos.com.ar/league/{url_name}/{league_id}) y extrayendo
+    el bloque __NEXT_DATA__, en vez de pegarle al subdominio
+    api.promiedos.com.ar directo.
+
+    Se cambio de estrategia porque api.promiedos.com.ar devuelve una
+    respuesta vacia ({}) a pedidos hechos con requests/Python, incluso
+    con headers de navegador -- probablemente por deteccion de bots a
+    nivel de infraestructura (fingerprint de la conexion, no solo
+    headers). El subdominio www., en cambio, sirve HTML renderizado
+    del lado del servidor (SSR) y no tiene ese problema: es la misma
+    tecnica que ya usamos para las paginas de equipo."""
+    url = f"{LEAGUE_PAGE_BASE}/{url_name}/{league_id}"
+    r = requests.get(url, timeout=timeout, headers=_HEADERS)
     r.raise_for_status()
-    return r.json()
+    match = _NEXT_DATA_RE.search(r.text)
+    if not match:
+        raise ValueError(
+            f"No se encontro __NEXT_DATA__ en {url}. "
+            "Es posible que Promiedos haya cambiado la estructura de la pagina."
+        )
+    payload = json.loads(match.group(1))
+    return payload["props"]["pageProps"]["data"]
 
 
 # ----------------------- TABLAS DE POSICIONES -----------------------------
@@ -155,8 +190,7 @@ def fetch_team_page_data(url_name, team_id, timeout=20):
     servidor (SSR) -- no hace falta JavaScript ni un endpoint de API
     separado, alcanza con un GET normal."""
     url = f"{TEAM_PAGE_BASE}/{url_name}/{team_id}"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; prode-personal-bot/1.0)"}
-    r = requests.get(url, timeout=timeout, headers=headers)
+    r = requests.get(url, timeout=timeout, headers=_HEADERS)
     r.raise_for_status()
     match = _NEXT_DATA_RE.search(r.text)
     if not match:

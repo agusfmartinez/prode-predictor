@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 ultima_fecha_pronosticos.txt
+prode.db
