@@ -91,6 +91,31 @@ CREATE TABLE IF NOT EXISTS standings_anual (
     updated_at TEXT,
     PRIMARY KEY (team_id)
 );
+
+-- Log de pronosticos: se guarda UNA vez por partido (game_id de
+-- Promiedos, asi no se pisa si se re-corre el script antes de que se
+-- juegue) y se completa con el resultado real cuando el partido ya
+-- termino. Sirve para medir el % de acierto del modelo con el tiempo
+-- y decidir con datos (no a ojo) si vale la pena ajustar los pesos de
+-- stakes_multiplier, el HOME_ADVANTAGE, etc.
+CREATE TABLE IF NOT EXISTS predictions_log (
+    game_id TEXT PRIMARY KEY,
+    round_name TEXT,
+    home_team_id INTEGER NOT NULL REFERENCES teams(id),
+    away_team_id INTEGER NOT NULL REFERENCES teams(id),
+    predicted_at TEXT,
+    pred_home_goals INTEGER,
+    pred_away_goals INTEGER,
+    pct_home INTEGER,
+    pct_draw INTEGER,
+    pct_away INTEGER,
+    pick TEXT,               -- '1' / 'X' / '2'
+    actual_home_goals INTEGER,
+    actual_away_goals INTEGER,
+    actual_result TEXT,      -- '1' / 'X' / '2', NULL hasta que se juegue
+    pick_correct INTEGER,    -- 0 / 1, NULL hasta que se juegue
+    evaluated_at TEXT
+);
 """
 
 
@@ -243,6 +268,68 @@ def away_form(conn, team_id, last_n=5):
 def zone_position(conn, team_id):
     row = conn.execute("SELECT position FROM standings_zone WHERE team_id = ?", (team_id,)).fetchone()
     return row[0] if row else None
+
+
+# ----------------------- LOG DE PRONOSTICOS -----------------------------
+
+def log_prediction(conn, game_id, round_name, home_team_id, away_team_id, pred):
+    """Guarda el pronostico hecho para un partido, UNA sola vez por
+    game_id (INSERT OR IGNORE): si el script se re-corre antes de que
+    se juegue el partido, no pisa el pronostico ya guardado -- queda
+    el primero que se hizo, que es el que tiene sentido evaluar
+    despues."""
+    conn.execute(
+        """INSERT OR IGNORE INTO predictions_log
+           (game_id, round_name, home_team_id, away_team_id, predicted_at,
+            pred_home_goals, pred_away_goals, pct_home, pct_draw, pct_away, pick)
+           VALUES (?,?,?,?, datetime('now'), ?,?,?,?,?,?)""",
+        (game_id, round_name, home_team_id, away_team_id,
+         pred["score"][0], pred["score"][1],
+         pred["pct_home"], pred["pct_draw"], pred["pct_away"], pred["pick"]),
+    )
+    conn.commit()
+
+
+def evaluate_prediction(conn, game_id, home_goals, away_goals):
+    """Si hay un pronostico pendiente guardado para ese game_id, lo
+    completa con el resultado real y marca si acerto o no. No hace
+    nada si ese partido no tiene un pronostico guardado (por ejemplo,
+    partidos que ya estaban jugados la primera vez que se corrio el
+    predictor, o partidos cargados solo por backfill_history.py)."""
+    if home_goals > away_goals:
+        actual = "1"
+    elif home_goals < away_goals:
+        actual = "2"
+    else:
+        actual = "X"
+
+    row = conn.execute(
+        "SELECT pick, pick_correct FROM predictions_log WHERE game_id = ?", (game_id,)
+    ).fetchone()
+    if not row or row[1] is not None:
+        return  # no hay pronostico guardado, o ya se evaluo antes
+
+    pick, _ = row
+    correct = 1 if pick == actual else 0
+    conn.execute(
+        """UPDATE predictions_log SET
+             actual_home_goals=?, actual_away_goals=?, actual_result=?,
+             pick_correct=?, evaluated_at=datetime('now')
+           WHERE game_id=?""",
+        (home_goals, away_goals, actual, correct, game_id),
+    )
+    conn.commit()
+
+
+def accuracy_summary(conn):
+    """Devuelve (aciertos, total) sobre todos los pronosticos ya
+    evaluados (partidos que ya se jugaron)."""
+    rows = conn.execute(
+        "SELECT pick_correct FROM predictions_log WHERE pick_correct IS NOT NULL"
+    ).fetchall()
+    total = len(rows)
+    correct = sum(r[0] for r in rows)
+    return correct, total
 
 
 # ----------------------- FACTOR "NECESIDAD DE PUNTOS" -----------------------------

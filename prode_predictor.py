@@ -188,12 +188,14 @@ def build_report(conn, round_name, games):
     lines = [f"PRONOSTICOS - {round_name} (Torneo Clausura 2026)\n"]
     for g in games:
         if g["finished"]:
+            db.evaluate_prediction(conn, g["id"], g["home_goals"], g["away_goals"])
             lines.append(f"{g['home_team_name']} {g['home_goals']}-{g['away_goals']} {g['away_team_name']} (Final)\n")
             continue
 
         home_id = db.get_or_create_team(conn, g["home_team_name"])
         away_id = db.get_or_create_team(conn, g["away_team_name"])
         pred = predict_match(conn, home_id, away_id)
+        db.log_prediction(conn, g["id"], round_name, home_id, away_id, pred)
 
         lines.append(
             f"{g['home_team_name']} vs {g['away_team_name']}\n"
@@ -201,6 +203,12 @@ def build_report(conn, round_name, games):
             f"  1: {pred['pct_home']}%  X: {pred['pct_draw']}%  2: {pred['pct_away']}%\n"
             f"  Pronostico: {pred['pick']}\n"
         )
+
+    correct, total = db.accuracy_summary(conn)
+    if total > 0:
+        pct = round(correct / total * 100)
+        lines.append(f"\n(Historial de aciertos hasta ahora: {correct}/{total} = {pct}%)\n")
+
     return "\n".join(lines)
 
 
