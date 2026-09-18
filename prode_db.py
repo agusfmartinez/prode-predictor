@@ -140,6 +140,9 @@ CREATE TABLE IF NOT EXISTS predictions_log (
     actual_away_goals INTEGER,
     actual_result TEXT,      -- '1' / 'X' / '2', NULL hasta que se juegue
     pick_correct INTEGER,    -- 0 / 1, NULL hasta que se juegue
+    prode_points INTEGER,    -- 3 si acerto el marcador exacto, 1 si
+                             -- acerto el ganador pero no el marcador,
+                             -- 0 si no acerto nada. NULL hasta jugarse.
     evaluated_at TEXT
 );
 """
@@ -192,6 +195,25 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE matches ADD COLUMN game_id TEXT")
         print("Migracion: columna 'game_id' agregada (se completa solo la proxima "
               "vez que corras backfill_history.py o prode_predictor.py).")
+
+    pred_cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions_log)").fetchall()}
+    if "prode_points" not in pred_cols:
+        conn.execute("ALTER TABLE predictions_log ADD COLUMN prode_points INTEGER")
+        # Recalculamos los puntos para lo que ya estaba evaluado (no
+        # hace falta volver a jugar los partidos, ya tenemos guardado
+        # el marcador pronosticado y el real).
+        rows = conn.execute(
+            """SELECT game_id, pred_home_goals, pred_away_goals,
+                      actual_home_goals, actual_away_goals, pick_correct
+               FROM predictions_log WHERE pick_correct IS NOT NULL"""
+        ).fetchall()
+        for game_id, ph, pa, ah, aa, correct in rows:
+            points = 3 if (ph == ah and pa == aa) else (1 if correct else 0)
+            conn.execute(
+                "UPDATE predictions_log SET prode_points = ? WHERE game_id = ?",
+                (points, game_id),
+            )
+        print(f"Migracion: columna 'prode_points' agregada y calculada para {len(rows)} pronosticos ya evaluados.")
 
     conn.commit()
 
@@ -364,10 +386,12 @@ def log_prediction(conn, game_id, round_name, home_team_id, away_team_id, pred):
 
 def evaluate_prediction(conn, game_id, home_goals, away_goals):
     """Si hay un pronostico pendiente guardado para ese game_id, lo
-    completa con el resultado real y marca si acerto o no. No hace
-    nada si ese partido no tiene un pronostico guardado (por ejemplo,
-    partidos que ya estaban jugados la primera vez que se corrio el
-    predictor, o partidos cargados solo por backfill_history.py)."""
+    completa con el resultado real, marca si acerto el ganador, y
+    calcula los puntos de prode reales:
+      3 puntos: acerto el marcador exacto
+      1 punto:  acerto el ganador (1/X/2) pero no el marcador exacto
+      0 puntos: no acerto el ganador
+    No hace nada si ese partido no tiene un pronostico guardado."""
     if home_goals > away_goals:
         actual = "1"
     elif home_goals < away_goals:
@@ -376,19 +400,28 @@ def evaluate_prediction(conn, game_id, home_goals, away_goals):
         actual = "X"
 
     row = conn.execute(
-        "SELECT pick, pick_correct FROM predictions_log WHERE game_id = ?", (game_id,)
+        """SELECT pick, pred_home_goals, pred_away_goals, pick_correct
+           FROM predictions_log WHERE game_id = ?""",
+        (game_id,),
     ).fetchone()
-    if not row or row[1] is not None:
+    if not row or row[3] is not None:
         return  # no hay pronostico guardado, o ya se evaluo antes
 
-    pick, _ = row
+    pick, pred_home, pred_away, _ = row
     correct = 1 if pick == actual else 0
+    if pred_home == home_goals and pred_away == away_goals:
+        points = 3
+    elif correct:
+        points = 1
+    else:
+        points = 0
+
     conn.execute(
         """UPDATE predictions_log SET
              actual_home_goals=?, actual_away_goals=?, actual_result=?,
-             pick_correct=?, evaluated_at=datetime('now')
+             pick_correct=?, prode_points=?, evaluated_at=datetime('now')
            WHERE game_id=?""",
-        (home_goals, away_goals, actual, correct, game_id),
+        (home_goals, away_goals, actual, correct, points, game_id),
     )
     conn.commit()
 
@@ -422,14 +455,16 @@ def evaluate_pending_predictions(conn):
 
 
 def accuracy_summary(conn):
-    """Devuelve (aciertos, total) sobre todos los pronosticos ya
-    evaluados (partidos que ya se jugaron)."""
+    """Devuelve (aciertos_de_ganador, total, puntos_prode_totales)
+    sobre todos los pronosticos ya evaluados (partidos que ya se
+    jugaron)."""
     rows = conn.execute(
-        "SELECT pick_correct FROM predictions_log WHERE pick_correct IS NOT NULL"
+        "SELECT pick_correct, prode_points FROM predictions_log WHERE pick_correct IS NOT NULL"
     ).fetchall()
     total = len(rows)
     correct = sum(r[0] for r in rows)
-    return correct, total
+    points = sum(r[1] or 0 for r in rows)
+    return correct, total, points
 
 
 # ----------------------- FACTOR "NECESIDAD DE PUNTOS" -----------------------------

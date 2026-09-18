@@ -219,10 +219,14 @@ def build_report(conn, round_name, games):
             f"  Pronostico: {pred['pick']}\n"
         )
 
-    correct, total = db.accuracy_summary(conn)
+    correct, total, points = db.accuracy_summary(conn)
     if total > 0:
         pct = round(correct / total * 100)
-        lines.append(f"\n(Historial de aciertos hasta ahora: {correct}/{total} = {pct}%)\n")
+        max_points = total * 3
+        lines.append(
+            f"\n(Historial: {correct}/{total} ganadores acertados ({pct}%) "
+            f"-- {points} puntos de prode sobre un maximo posible de {max_points})\n"
+        )
 
     return "\n".join(lines)
 
