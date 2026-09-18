@@ -58,14 +58,21 @@ def store_games(conn, games, valid_team_ids=None):
             date = datetime.strptime(g["start_time"], "%d-%m-%Y %H:%M").date().isoformat()
         except (ValueError, TypeError):
             date = g["start_time"] or ""
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO matches
-               (date, matchday, round_name, stage, home_team_id, away_team_id, home_goals, away_goals)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (date, 0, g.get("round_name") or "", db.infer_stage(date), home_id, away_id,
-             g["home_goals"], g["away_goals"]),
+        exists_before = conn.execute(
+            "SELECT 1 FROM matches WHERE date=? AND home_team_id=? AND away_team_id=?",
+            (date, home_id, away_id),
+        ).fetchone() is not None
+
+        conn.execute(
+            """INSERT INTO matches
+               (date, matchday, round_name, stage, game_id, home_team_id, away_team_id, home_goals, away_goals)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(date, home_team_id, away_team_id) DO UPDATE SET
+                 game_id=excluded.game_id""",
+            (date, 0, g.get("round_name") or "", db.infer_stage(date), g["id"],
+             home_id, away_id, g["home_goals"], g["away_goals"]),
         )
-        if cur.rowcount:
+        if not exists_before:
             added += 1
     return added, skipped_other_competition
 
@@ -121,6 +128,10 @@ def main():
 
     print(f"\nListo. {total_added} partidos nuevos agregados al historial "
           f"({total_skipped} descartados por ser de otra competencia).")
+
+    evaluated = db.evaluate_pending_predictions(conn)
+    if evaluated:
+        print(f"Se evaluaron {evaluated} pronosticos pendientes contra resultados reales.")
     conn.close()
 
 

@@ -112,11 +112,13 @@ def sync_current_round(conn, data):
         except (ValueError, TypeError):
             date = g["start_time"] or ""
         conn.execute(
-            """INSERT OR IGNORE INTO matches
-               (date, matchday, round_name, stage, home_team_id, away_team_id, home_goals, away_goals)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (date, 0, g.get("round_name") or "", db.infer_stage(date), home_id, away_id,
-             g["home_goals"], g["away_goals"]),
+            """INSERT INTO matches
+               (date, matchday, round_name, stage, game_id, home_team_id, away_team_id, home_goals, away_goals)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(date, home_team_id, away_team_id) DO UPDATE SET
+                 game_id=excluded.game_id""",
+            (date, 0, g.get("round_name") or "", db.infer_stage(date), g["id"],
+             home_id, away_id, g["home_goals"], g["away_goals"]),
         )
     conn.commit()
     return round_name, parsed
@@ -239,6 +241,15 @@ def main():
     data = pc.fetch_league(LEAGUE_ID)
     sync_standings(conn, data)
     round_name, games = sync_current_round(conn, data)
+
+    # Barre TODOS los pronosticos pendientes (no solo los de la fecha
+    # actual) contra lo que haya en `matches`. Cubre el caso de
+    # partidos que terminaron despues de que Promiedos ya habia
+    # avanzado a la fecha siguiente (ver nota en evaluate_pending_predictions).
+    newly_evaluated = db.evaluate_pending_predictions(conn)
+    if newly_evaluated:
+        print(f"({newly_evaluated} pronosticos de fechas anteriores se evaluaron recien ahora)\n")
+
     report = build_report(conn, round_name, games)
     print(report)
     send_telegram(report)

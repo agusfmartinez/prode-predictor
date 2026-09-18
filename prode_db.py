@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS matches (
                       -- (ver STAGE_CUTOFF_DATE). Promiedos no manda esto
                       -- directo en cada partido, solo en las tablas
                       -- agregadas, asi que lo inferimos nosotros.
+    game_id TEXT,     -- el id real que le pone Promiedos a este partido.
+                      -- Se usa para evaluar predictions_log sin depender
+                      -- de que el partido siga apareciendo en "la fecha
+                      -- actual" de una corrida futura.
     home_team_id INTEGER NOT NULL REFERENCES teams(id),
     away_team_id INTEGER NOT NULL REFERENCES teams(id),
     home_goals INTEGER NOT NULL,
@@ -183,6 +187,11 @@ def migrate_schema(conn):
                 (infer_stage(date), match_id),
             )
         print(f"Migracion: columna 'stage' agregada y completada para {len(rows)} partidos.")
+
+    if "game_id" not in cols:
+        conn.execute("ALTER TABLE matches ADD COLUMN game_id TEXT")
+        print("Migracion: columna 'game_id' agregada (se completa solo la proxima "
+              "vez que corras backfill_history.py o prode_predictor.py).")
 
     conn.commit()
 
@@ -382,6 +391,34 @@ def evaluate_prediction(conn, game_id, home_goals, away_goals):
         (home_goals, away_goals, actual, correct, game_id),
     )
     conn.commit()
+
+
+def evaluate_pending_predictions(conn):
+    """Recorre TODOS los pronosticos pendientes (de cualquier fecha,
+    no solo la que Promiedos marca como 'actual' en esta corrida) y
+    los evalua contra lo que haya en `matches`, buscando por game_id.
+
+    Esto es necesario porque una vez que Promiedos avanza a la fecha
+    siguiente, deja de traernos los partidos de la fecha anterior --
+    si esta funcion no barriera todo predictions_log, un partido que
+    terminara DESPUES de que la fecha ya avanzo se quedaria pendiente
+    para siempre. Se recomienda correr backfill_history.py de tanto
+    en tanto (trae el historial completo de cada equipo, no solo la
+    fecha actual) para que `matches` este al dia antes de llamar a
+    esta funcion. Devuelve cuantos pronosticos evaluo en esta pasada."""
+    pending = conn.execute(
+        "SELECT game_id FROM predictions_log WHERE pick_correct IS NULL"
+    ).fetchall()
+    evaluated = 0
+    for (game_id,) in pending:
+        row = conn.execute(
+            "SELECT home_goals, away_goals FROM matches WHERE game_id = ?",
+            (game_id,),
+        ).fetchone()
+        if row:
+            evaluate_prediction(conn, game_id, row[0], row[1])
+            evaluated += 1
+    return evaluated
 
 
 def accuracy_summary(conn):
