@@ -26,6 +26,7 @@ Nota sobre el historial completo (para home_form / away_form):
 
 import os
 import math
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -43,6 +44,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 LEAGUE_AVG_GOALS_PER_TEAM = 1.30
 HOME_ADVANTAGE = 1.15
 LAST_N_GAMES = 5
+# Si a la fecha que marca Promiedos le quedan esta cantidad de partidos
+# sin jugar (o menos), tambien se pronostica la fecha siguiente.
+MAX_PENDING_TO_FETCH_NEXT = 2
 
 
 # ----------------------- PASO 1: TRAER Y GUARDAR DATOS -----------------------------
@@ -97,8 +101,8 @@ def sync_standings(conn, data):
 
 def sync_current_round(conn, data):
     """Guarda los partidos ya finalizados de la fecha actual en
-    `matches` (para ir acumulando historial), y devuelve la lista de
-    partidos de esa fecha para el reporte."""
+    `matches` (para ir acumulando historial), y devuelve
+    (nombre_de_fecha, partidos) para el reporte."""
     round_name, games = pc.get_selected_round_games(data)
     parsed = [pc.parse_game(g) for g in games]
 
@@ -122,6 +126,50 @@ def sync_current_round(conn, data):
         )
     conn.commit()
     return round_name, parsed
+
+
+def fetch_next_round(data, round_name):
+    """Arma el fixture de la fecha siguiente a `round_name` usando los
+    proximos partidos (`games.next`) de las paginas de equipo.
+
+    Hace falta porque la pagina de liga de Promiedos no avanza a la
+    fecha nueva mientras a la actual le quede un partido postergado
+    (ej. Fecha 11 con Sarmiento vs River pasado a mitad de semana),
+    aunque la fecha nueva ya haya empezado. Pide una pagina por
+    equipo, salteando los equipos que ya aparecieron como rival, asi
+    que son ~15 requests en vez de 30."""
+    from backfill_history import get_all_teams, PAUSE_BETWEEN_REQUESTS
+
+    try:
+        next_name = f"Fecha {int(round_name.split()[-1]) + 1}"
+    except (AttributeError, ValueError):
+        return None, []
+
+    games, seen_teams = {}, set()
+    for url_name, team_id, name in get_all_teams(data):
+        if team_id in seen_teams:
+            continue
+        try:
+            team_data = pc.fetch_team_page_data(url_name, team_id)
+        except Exception as e:
+            print(f"(No pude traer la pagina de {name}: {e})")
+            continue
+        for g in pc.get_team_games(team_data, kind="next"):
+            if g.get("round_name") == next_name:
+                games[g["id"]] = g
+                seen_teams.update((g["home_team_id"], g["away_team_id"]))
+                break
+        time.sleep(PAUSE_BETWEEN_REQUESTS)
+
+    ordered = sorted(games.values(), key=lambda g: _start_key(g["start_time"]))
+    return next_name, ordered
+
+
+def _start_key(start_time):
+    try:
+        return datetime.strptime(start_time, "%d-%m-%Y %H:%M")
+    except (ValueError, TypeError):
+        return datetime.max
 
 
 # ----------------------- PASO 2: MODELO (igual que antes) -----------------------------
@@ -173,18 +221,22 @@ def predict_match(conn, home_id, away_id):
 
     max_goals = 6
     p_home = p_draw = p_away = 0.0
-    best_p, best_score = 0.0, (0, 0)
+    # Mejor marcador dentro de cada resultado posible (1 / X / 2)
+    best = {"1": (0.0, (1, 0)), "X": (0.0, (0, 0)), "2": (0.0, (0, 1))}
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
             p = poisson_pmf(exp_home, h) * poisson_pmf(exp_away, a)
             if h > a:
                 p_home += p
+                outcome = "1"
             elif h == a:
                 p_draw += p
+                outcome = "X"
             else:
                 p_away += p
-            if p > best_p:
-                best_p, best_score = p, (h, a)
+                outcome = "2"
+            if p > best[outcome][0]:
+                best[outcome] = (p, (h, a))
 
     total = p_home + p_draw + p_away
     pct_home = round(p_home / total * 100)
@@ -193,31 +245,39 @@ def predict_match(conn, home_id, away_id):
     pick = "1" if pct_home >= pct_draw and pct_home >= pct_away else \
            "2" if pct_away >= pct_home and pct_away >= pct_draw else "X"
 
+    # El marcador sale del resultado elegido, asi nunca se contradicen
+    # (antes podia salir "0-0" con pronostico "1", y en el prode real
+    # uno anota el marcador, no el 1/X/2).
+    best_score = best[pick][1]
+
     return {"score": best_score, "pct_home": pct_home, "pct_draw": pct_draw,
             "pct_away": pct_away, "pick": pick}
 
 
 # ----------------------- PASO 3: REPORTE -----------------------------
 
-def build_report(conn, round_name, games):
-    lines = [f"PRONOSTICOS - {round_name} (Torneo Clausura 2026)\n"]
-    for g in games:
-        if g["finished"]:
-            db.evaluate_prediction(conn, g["id"], g["home_goals"], g["away_goals"])
-            lines.append(f"{g['home_team_name']} {g['home_goals']}-{g['away_goals']} {g['away_team_name']} (Final)\n")
-            continue
+def build_report(conn, rounds):
+    lines = []
+    for round_name, games in rounds:
+        lines.append(f"PRONOSTICOS - {round_name} (Torneo Clausura 2026)\n")
+        for g in games:
+            if g["finished"]:
+                db.evaluate_prediction(conn, g["id"], g["home_goals"], g["away_goals"])
+                lines.append(f"{g['home_team_name']} {g['home_goals']}-{g['away_goals']} {g['away_team_name']} (Final)\n")
+                continue
 
-        home_id = db.get_or_create_team(conn, g["home_team_name"])
-        away_id = db.get_or_create_team(conn, g["away_team_name"])
-        pred = predict_match(conn, home_id, away_id)
-        db.log_prediction(conn, g["id"], round_name, home_id, away_id, pred)
+            home_id = db.get_or_create_team(conn, g["home_team_name"])
+            away_id = db.get_or_create_team(conn, g["away_team_name"])
+            pred = predict_match(conn, home_id, away_id)
+            db.log_prediction(conn, g["id"], round_name, home_id, away_id, pred)
 
-        lines.append(
-            f"{g['home_team_name']} vs {g['away_team_name']}\n"
-            f"  Marcador probable: {pred['score'][0]}-{pred['score'][1]}\n"
-            f"  1: {pred['pct_home']}%  X: {pred['pct_draw']}%  2: {pred['pct_away']}%\n"
-            f"  Pronostico: {pred['pick']}\n"
-        )
+            lines.append(
+                f"{g['home_team_name']} vs {g['away_team_name']}\n"
+                f"  Marcador probable: {pred['score'][0]}-{pred['score'][1]}\n"
+                f"  1: {pred['pct_home']}%  X: {pred['pct_draw']}%  2: {pred['pct_away']}%\n"
+                f"  Pronostico: {pred['pick']}\n"
+            )
+        lines.append("")
 
     correct, total, points = db.accuracy_summary(conn)
     if total > 0:
@@ -245,6 +305,18 @@ def main():
     data = pc.fetch_league(LEAGUE_ID)
     sync_standings(conn, data)
     round_name, games = sync_current_round(conn, data)
+    rounds = [(round_name, games)]
+
+    # Si a la fecha actual le quedan solo partidos sueltos (postergados),
+    # Promiedos todavia no avanzo de fecha: traemos la siguiente desde
+    # las paginas de equipo para no quedarnos sin pronosticos.
+    pending = sum(1 for g in games if not g["finished"])
+    if pending <= MAX_PENDING_TO_FETCH_NEXT:
+        print(f"({round_name}: quedan {pending} partido(s) sin jugar, "
+              f"busco la fecha siguiente en las paginas de equipo...)\n")
+        next_name, next_games = fetch_next_round(data, round_name)
+        if next_games:
+            rounds.append((next_name, next_games))
 
     # Barre TODOS los pronosticos pendientes (no solo los de la fecha
     # actual) contra lo que haya en `matches`. Cubre el caso de
@@ -254,7 +326,7 @@ def main():
     if newly_evaluated:
         print(f"({newly_evaluated} pronosticos de fechas anteriores se evaluaron recien ahora)\n")
 
-    report = build_report(conn, round_name, games)
+    report = build_report(conn, rounds)
     print(report)
     send_telegram(report)
     with open("ultima_fecha_pronosticos.txt", "w", encoding="utf-8") as f:
